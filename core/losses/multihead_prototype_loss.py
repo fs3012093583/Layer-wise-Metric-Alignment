@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-def class_matrix_loss(h, y, num_classes=100, num_heads=1, tau=0.1):
+def class_matrix_loss(h, y, num_classes=100, num_heads=8, tau=1):
     """
     多头原型损失函数
     
@@ -15,12 +15,19 @@ def class_matrix_loss(h, y, num_classes=100, num_heads=1, tau=0.1):
     Returns:
         损失值
     """
+
+
+    # 新代码
     B, d = h.shape
+
+    # 确保 d 能被 num_heads 整除
+    if d % num_heads != 0:
+        # 调整 num_heads 为能整除 d 的最大因数
+        while d % num_heads != 0 and num_heads > 1:
+            num_heads -= 1
+
     d_k = d // num_heads
     h_multi = h.view(B, num_heads, d_k)
-    
-    # 子空间归一化
-    h_multi = F.normalize(h_multi, p=2, dim=-1)
     
     y_onehot = F.one_hot(y, num_classes).float().to(h.device)
     count = y_onehot.sum(dim=0) + 1e-6
