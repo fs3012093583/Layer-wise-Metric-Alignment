@@ -1,0 +1,72 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# data
+data/
+results/
+__pycache__/
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+swanlog/
+swanlab.json
+# Jupyter and checkpoints
+.ipynb_checkpoints/
+
+# Test and coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type check / lint caches
+.mypy_cache/
+.ruff_cache/
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+*.log
+tmp/
+temp/
+
+# Project data and outputs
+# Keep directory structure with optional .gitkeep if needed
+data/*
+!data/.gitkeep
+
+results/*
+!results/.gitkeep
+
+# Model checkpoints and heavy artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.npy
+
+# Experiment exports
+*.csv
+*.png
+*.pdf
+*.pth
+
