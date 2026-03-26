@@ -14,6 +14,7 @@ class LayerwiseOptimizer:
             config: 配置字典
         """
         self.model = model
+        self.w = w
         self.config = config
         self.update_strategy = config.get("update_strategy", "global")
         

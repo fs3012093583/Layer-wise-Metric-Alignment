@@ -1,3 +1,4 @@
+from sympy.integrals.laplace import I
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,8 +15,9 @@ from sl.swanlab_init import SwanlabMonitor
 from core.models.resnet import resnet20_cifar
 from core.losses.multihead_prototype_loss import class_matrix_loss
 from core.optimization.layerwise_optimizer import LayerwiseOptimizer, LayerwiseScheduler
-
+from core.losses.linear_classification_loss import linear_classification_loss
   
+
 
 def flatten_config(config, prefix=""):
     """递归展平配置字典，处理嵌套结构"""
@@ -73,10 +75,46 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
     
     # 损失函数
     task_criterion = nn.CrossEntropyLoss()
-    layer_criterion = class_matrix_loss
+    # layer_criterion = class_matrix_loss
+    layer_criterion = linear_classification_loss
     
     # 层级优化器
     optimizer = LayerwiseOptimizer(model, config)
+    
+    # 为每个层级创建可学习的权重参数
+    layer_weights = {}
+    all_weight_params = []
+        
+    is_w = False
+    w = {}
+    # 前向传播一次，获取各层特征维度
+    with torch.no_grad():
+        x, _ = next(iter(train_loader))
+        x = x.to(device)
+        features = model(x, return_features=True)
+        i = 0
+        for layer_name in config["loss_weights"]:
+            if layer_name != "final":
+                feat = features[layer_name]
+                feat = feat.view(feat.size(0), -1)
+                feature_dim = feat.shape[1]
+                # 创建可学习的权重参数
+                if is_w == True:
+                    continue
+                else :
+                    w[layer_name] = nn.Parameter(torch.randn(feature_dim, 100))
+                    nn.init.xavier_normal_(w[layer_name])
+                    i += 1
+                
+                w = w.to(device)
+                layer_weights[layer_name] = w[layer_name]
+                all_weight_params.append(w[layer_name])
+        is_w = True
+    
+    # 为权重参数创建单独的优化器
+    weight_optimizer = None
+    if len(all_weight_params) > 0:
+        weight_optimizer = torch.optim.Adam(all_weight_params, lr=config["lr"])
     
     # 学习率调度器
     scheduler = LayerwiseScheduler(optimizer, config)
@@ -104,6 +142,8 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
             x, y = x.to(device), y.to(device)
             
             optimizer.zero_grad()
+            if weight_optimizer is not None:
+                weight_optimizer.zero_grad()
             
             # 获取各层特征
             features = model(x, return_features=True)
@@ -125,7 +165,8 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
                         # 需要将特征展平
                         feat = features[layer_name]
                         feat = feat.view(feat.size(0), -1)
-                        loss = layer_criterion(feat, y, num_classes=100, tau=config.get("tau", 0.1))
+                        # 传入可学习的权重参数
+                        loss = layer_criterion(feat, y, num_classes=100, tau=config.get("tau", 0.1), w=layer_weights[layer_name])
                     
                     all_losses[layer_name] = weight * loss
                     batch_losses[layer_name] = loss.item()
@@ -151,6 +192,10 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
                         for param in optimizer.layer_params[layer_name]:
                             if param.grad is not None:
                                 param.grad.zero_()
+                
+                # 更新权重参数
+                if weight_optimizer is not None:
+                    weight_optimizer.step()
             else:
                 # 全局更新：一次性更新所有参数
                 total_loss = 0.0
@@ -163,7 +208,8 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
                         # 需要将特征展平
                         feat = features[layer_name]
                         feat = feat.view(feat.size(0), -1)
-                        loss = layer_criterion(feat, y, num_classes=100, tau=config.get("tau", 0.1))
+                        # 传入可学习的权重参数
+                        loss = layer_criterion(feat, y, num_classes=100, tau=config.get("tau", 1), w=layer_weights[layer_name])
                     
                     batch_losses[layer_name] = loss.item()
                     total_loss += weight * loss
@@ -177,6 +223,8 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
                 
                 # 执行优化步骤
                 optimizer.step()
+                if weight_optimizer is not None:
+                    weight_optimizer.step()
             
             # 累积各层损失
             for layer_name, loss_value in batch_losses.items():
@@ -389,7 +437,7 @@ def train_layerwise_simple():
     """
     config = {
         "batch_size": 256,
-        "epochs": 50,
+        "epochs": 200,
         "lr": 1e-3,
         "weight_decay": 1e-3,
         "clip_grad": 1.0,
@@ -398,10 +446,10 @@ def train_layerwise_simple():
         "update_strategy": "global",
         "num_heads": 8,
         "loss_weights": {
-            "layer1": 10,
-            "layer2": 0.01,
-            "layer3": 10,
-            "final": 0.1
+            # "layer1": 0.2,
+            "layer2": 0.2,
+            # "layer3": 0.3,
+            "final": 0.3
         }
     }
     
@@ -453,7 +501,7 @@ def train_layerwise_simple():
 if __name__ == "__main__":
     # 运行简化版训练
     model, acc = train_layerwise_simple()
-    print("修改loss")
+    print("交叉商损失")
     # 如果需要运行多个实验，取消下面的注释
     # results = run_layerwise_experiments()
     
