@@ -1,19 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import os
+import pickle
 import sys
 from pathlib import Path
 from datetime import datetime
+import numpy as np
+
+try:
+    from torchvision import datasets, transforms
+except ImportError:  # pragma: no cover - optional dependency
+    datasets = None
+    transforms = None
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from sl.swanlab_init import SwanlabMonitor
 from core.models.resnet import resnet20_cifar
-from core.losses.multihead_prototype_loss import class_matrix_loss
-from core.optimization.layerwise_optimizer import LayerwiseOptimizer, LayerwiseScheduler
 
   
 
@@ -51,7 +57,103 @@ def generate_experiment_name(config):
     # 组合实验名称
     return f"config_{config_str}_{current_time}"
 
-# 在代码中使用
+
+class LocalCIFAR100(torch.utils.data.Dataset):
+    def __init__(self, root, train=True, transform=None):
+        split = "train" if train else "test"
+        file_path = Path(root) / "cifar-100-python" / split
+        with open(file_path, "rb") as f:
+            raw = pickle.load(f, encoding="bytes")
+        self.data = torch.from_numpy(np.asarray(raw[b"data"]).reshape(-1, 3, 32, 32))
+        self.labels = raw[b"fine_labels"]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        image = self.data[idx]
+        label = self.labels[idx]
+        if self.transform is not None:
+            image = self.transform(image)
+        else:
+            image = image.float().div(255.0)
+        return image, label
+
+
+class CIFARTransform:
+    def __init__(self, train=True):
+        self.train = train
+        self.mean = torch.tensor((0.5071, 0.4867, 0.4408)).view(3, 1, 1)
+        self.std = torch.tensor((0.2675, 0.2565, 0.2761)).view(3, 1, 1)
+
+    def __call__(self, image):
+        image = image.float().div(255.0)
+        if self.train:
+            image = nn.functional.pad(image, (4, 4, 4, 4), mode="reflect")
+            top = torch.randint(0, 9, ()).item()
+            left = torch.randint(0, 9, ()).item()
+            image = image[:, top:top + 32, left:left + 32]
+            if torch.rand(()) < 0.5:
+                image = torch.flip(image, dims=(2,))
+        return (image - self.mean) / self.std
+
+
+def build_cifar100_datasets():
+    if datasets is not None and transforms is not None:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        ])
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        ])
+        train_set = datasets.CIFAR100(root="./data", train=True, download=True, transform=transform_train)
+        test_set = datasets.CIFAR100(root="./data", train=False, download=True, transform=transform_test)
+        return train_set, test_set
+
+    train_set = LocalCIFAR100(root="./data", train=True, transform=CIFARTransform(train=True))
+    test_set = LocalCIFAR100(root="./data", train=False, transform=CIFARTransform(train=False))
+    return train_set, test_set
+
+
+class LayerwiseProjectionHeads(nn.Module):
+    def __init__(self, feature_dims, projection_dim):
+        super().__init__()
+        self.heads = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(dim, projection_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(projection_dim, projection_dim),
+            )
+            for name, dim in feature_dims.items()
+        })
+
+    def forward(self, layer_name, x):
+        return self.heads[layer_name](x)
+
+
+def prototype_alignment_loss(h, y, num_classes=100, tau=0.2):
+    h = nn.functional.normalize(h, p=2, dim=1)
+    y_onehot = nn.functional.one_hot(y, num_classes).float().to(h.device)
+    count = y_onehot.sum(dim=0).clamp_min(1.0)
+    prototypes = (y_onehot.T @ h) / count.unsqueeze(1)
+    prototypes = nn.functional.normalize(prototypes, p=2, dim=1)
+    logits = (h @ prototypes.T) / tau
+    return nn.functional.cross_entropy(logits, y)
+
+
+def prepare_aux_feature(feature):
+    if feature.dim() == 4:
+        feature = nn.functional.adaptive_avg_pool2d(feature, output_size=1)
+        feature = feature.flatten(1)
+    else:
+        feature = feature.view(feature.size(0), -1)
+    return feature
 
 
 # =========================
@@ -71,24 +173,46 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
-    # 损失函数
     task_criterion = nn.CrossEntropyLoss()
-    layer_criterion = class_matrix_loss
-    
-    # 层级优化器
-    optimizer = LayerwiseOptimizer(model, config)
-    
-    # 学习率调度器
-    scheduler = LayerwiseScheduler(optimizer, config)
+    aux_layers = config.get("aux_layers", ["layer3"])
+    feature_dims = {"layer1": 16, "layer2": 32, "layer3": 64, "avgpool": 64}
+    projection_heads = LayerwiseProjectionHeads(
+        {layer: feature_dims[layer] for layer in aux_layers},
+        projection_dim=config.get("projection_dim", 128),
+    ).to(device)
+
+    if config.get("update_strategy", "global") != "global":
+        print("Local update is disabled in this optimized run; falling back to global update.")
+
+    optimizer_name = config.get("optimizer", "Adam")
+    parameter_groups = list(model.parameters()) + list(projection_heads.parameters())
+    if optimizer_name == "SGD":
+        optimizer = optim.SGD(
+            parameter_groups,
+            lr=config["lr"],
+            momentum=config.get("momentum", 0.9),
+            weight_decay=config.get("weight_decay", 5e-4),
+        )
+    else:
+        optimizer = optim.Adam(
+            parameter_groups,
+            lr=config["lr"],
+            weight_decay=config.get("weight_decay", 1e-4),
+        )
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
+    max_train_batches = config.get("max_train_batches")
+    max_test_batches = config.get("max_test_batches")
     
     best_acc = 0.0
     global_step = 0
     
     print(f"\n{'='*60}")
     print(f"Layer-wise Training on CIFAR-100")
-    print(f"Update Strategy: {config['update_strategy']}")
+    print("Update Strategy: global")
     print(f"Total epochs: {config['epochs']}")
     print(f"Learning rate: {config['lr']}")
+    print(f"Aux layers: {aux_layers}")
     print(f"Loss weights: {config['loss_weights']}")
     print(f"{'='*60}\n")
     
@@ -101,6 +225,8 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
         epoch_losses = {}  # 用于累积每个层级的损失
         
         for batch_idx, (x, y) in enumerate(train_loader):
+            if max_train_batches is not None and batch_idx >= max_train_batches:
+                break
             x, y = x.to(device), y.to(device)
             
             optimizer.zero_grad()
@@ -111,72 +237,31 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
             # 计算各层损失
             batch_losses = {}
             
-            # 根据更新策略执行不同的损失计算和更新
-            if config["update_strategy"] == "local":
-                # 局部更新：为每个层级单独计算损失和更新
-                # 首先计算所有层的损失，确保所有参数都有梯度
-                all_losses = {}
-                for layer_name, weight in config["loss_weights"].items():
-                    if layer_name == "final":
-                        # 最终层使用交叉熵损失
-                        loss = task_criterion(features[layer_name], y)
-                    else:
-                        # 中间层使用自定义损失
-                        # 需要将特征展平
-                        feat = features[layer_name]
-                        feat = feat.view(feat.size(0), -1)
-                        loss = layer_criterion(feat, y, num_classes=100, tau=config.get("tau", 0.1))
-                    
-                    all_losses[layer_name] = weight * loss
-                    batch_losses[layer_name] = loss.item()
-                
-                # 计算总损失并反向传播，确保所有参数都有梯度
-                total_loss = sum(all_losses.values())
-                total_loss.backward()
-                
-                # 对每个选中的层级执行参数更新
-                for layer_name in config["loss_weights"].keys():
-                    # 梯度裁剪（可选）
-                    if config.get("clip_grad", 0) > 0:
-                        # 只裁剪当前层的参数梯度
-                        if hasattr(optimizer, 'layer_params') and layer_name in optimizer.layer_params:
-                            params = optimizer.layer_params[layer_name]
-                            torch.nn.utils.clip_grad_norm_(params, config["clip_grad"])
-                    
-                    # 更新当前层的参数
-                    optimizer.step(layer_name)
-                    
-                    # 清除当前层的梯度，避免影响其他层的更新
-                    if hasattr(optimizer, 'layer_params') and layer_name in optimizer.layer_params:
-                        for param in optimizer.layer_params[layer_name]:
-                            if param.grad is not None:
-                                param.grad.zero_()
-            else:
-                # 全局更新：一次性更新所有参数
-                total_loss = 0.0
-                for layer_name, weight in config["loss_weights"].items():
-                    if layer_name == "final":
-                        # 最终层使用交叉熵损失
-                        loss = task_criterion(features[layer_name], y)
-                    else:
-                        # 中间层使用自定义损失
-                        # 需要将特征展平
-                        feat = features[layer_name]
-                        feat = feat.view(feat.size(0), -1)
-                        loss = layer_criterion(feat, y, num_classes=100, tau=config.get("tau", 0.1))
-                    
-                    batch_losses[layer_name] = loss.item()
-                    total_loss += weight * loss
-                
-                # 反向传播
-                total_loss.backward()
-                
-                # 梯度裁剪（可选）
-                if config.get("clip_grad", 0) > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad"])
-                
-                # 执行优化步骤
-                optimizer.step()
+            total_loss = config["loss_weights"].get("final", 1.0) * task_criterion(features["final"], y)
+            batch_losses["final"] = total_loss.item()
+
+            for layer_name in aux_layers:
+                feat = prepare_aux_feature(features[layer_name])
+                projected = projection_heads(layer_name, feat)
+                aux_loss = prototype_alignment_loss(
+                    projected,
+                    y,
+                    num_classes=100,
+                    tau=config.get("tau", 0.2),
+                )
+                weight = config["loss_weights"].get(layer_name, 0.0)
+                total_loss = total_loss + weight * aux_loss
+                batch_losses[layer_name] = aux_loss.item()
+
+            total_loss.backward()
+
+            if config.get("clip_grad", 0) > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.parameters()) + list(projection_heads.parameters()),
+                    config["clip_grad"],
+                )
+
+            optimizer.step()
             
             # 累积各层损失
             for layer_name, loss_value in batch_losses.items():
@@ -195,18 +280,28 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
             global_step += 1
         
         # 计算各层的平均损失
+        effective_train_batches = max(1, min(len(train_loader), max_train_batches or len(train_loader)))
         for layer_name in epoch_losses:
-            epoch_losses[layer_name] /= len(train_loader)
+            epoch_losses[layer_name] /= effective_train_batches
         
         # 学习率更新
         scheduler.step()
         
         # 计算训练集准确率
         train_acc = 100.0 * train_correct / train_total
-        avg_train_loss = train_loss / len(train_loader)
-        
+        avg_train_loss = train_loss / effective_train_batches
+
         # 测试阶段
-        test_acc, test_loss = evaluate_layerwise(model, test_loader, task_criterion, device)
+        test_acc, test_loss = evaluate_layerwise(
+            model,
+            test_loader,
+            task_criterion,
+            device,
+            max_batches=max_test_batches,
+        )
+
+        if test_acc > best_acc:
+            best_acc = test_acc
         
         # 保存最佳模型
         # if test_acc > best_acc:
@@ -242,7 +337,7 @@ def train_layerwise(model, train_loader, test_loader, monitor, config):
     
     return model, best_acc
 
-def evaluate_layerwise(model, test_loader, criterion, device):
+def evaluate_layerwise(model, test_loader, criterion, device, max_batches=None):
     """
     层级模型的评估函数
     """
@@ -252,7 +347,9 @@ def evaluate_layerwise(model, test_loader, criterion, device):
     total = 0
     
     with torch.no_grad():
-        for x, y in test_loader:
+        for batch_idx, (x, y) in enumerate(test_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
             x, y = x.to(device), y.to(device)
             outputs = model(x)
             loss = criterion(outputs, y)
@@ -311,22 +408,7 @@ def run_layerwise_experiments():
         }
     ]
     
-    # 数据加载
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
-    ])
-
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
-    ])
-
-    train_set = datasets.CIFAR100(root="./data", train=True, download=True, transform=transform_train)
-    test_set = datasets.CIFAR100(root="./data", train=False, download=True, transform=transform_test)
+    train_set, test_set = build_cifar100_datasets()
     
     results = {}
     
@@ -388,39 +470,26 @@ def train_layerwise_simple():
     简化版层级损失训练
     """
     config = {
-        "batch_size": 256,
-        "epochs": 50,
+        "batch_size": int(os.environ.get("LMA_BATCH_SIZE", 128)),
+        "epochs": int(os.environ.get("LMA_EPOCHS", 3)),
         "lr": 1e-3,
-        "weight_decay": 1e-3,
+        "weight_decay": 1e-4,
         "clip_grad": 1.0,
-        "optimizer": "Adam",
-        "tau": 1,
+        "optimizer": os.environ.get("LMA_OPTIMIZER", "Adam"),
+        "tau": float(os.environ.get("LMA_TAU", 0.2)),
         "update_strategy": "global",
-        "num_heads": 8,
+        "projection_dim": int(os.environ.get("LMA_PROJ_DIM", 128)),
+        "max_train_batches": int(os.environ["LMA_MAX_TRAIN_BATCHES"]) if "LMA_MAX_TRAIN_BATCHES" in os.environ else None,
+        "max_test_batches": int(os.environ["LMA_MAX_TEST_BATCHES"]) if "LMA_MAX_TEST_BATCHES" in os.environ else None,
+        "aux_layers": ["layer3", "avgpool"],
         "loss_weights": {
-            "layer1": 10,
-            "layer2": 0.01,
-            "layer3": 10,
-            "final": 0.1
+            "layer3": 0.05,
+            "avgpool": 0.1,
+            "final": 1.0
         }
     }
     
-    # 数据加载
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
-    ])
-
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
-    ])
-
-    train_set = datasets.CIFAR100(root="./data", train=True, download=True, transform=transform_train)
-    test_set = datasets.CIFAR100(root="./data", train=False, download=True, transform=transform_test)
+    train_set, test_set = build_cifar100_datasets()
     
     train_loader = DataLoader(train_set, batch_size=config["batch_size"], shuffle=True, num_workers=4)
     test_loader = DataLoader(test_set, batch_size=config["batch_size"], shuffle=False, num_workers=4)

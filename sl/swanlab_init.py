@@ -1,16 +1,25 @@
-import swanlab
+try:
+    import swanlab
+except ImportError:  # pragma: no cover - optional dependency
+    swanlab = None
 
 class SwanlabMonitor:
     def __init__(self, project="GMA-Metric-Alignment", experiment_name="Layer-wise-CIFAR100"):
-        # 1. 登录 (建议将 API Key 放在环境变量或配置文件中，这里先按你的要求写)
-        swanlab.login(api_key="TaeDjfuP66mvYqL9hVn33") 
         self.project = project
         self.experiment_name = experiment_name
+        self.enabled = swanlab is not None
+        if self.enabled:
+            try:
+                swanlab.login()
+            except Exception:
+                self.enabled = False
 
     def init_experiment(self, config=None):
         """
         初始化实验，传入超参数字典 config
         """
+        if not self.enabled:
+            return None
         experiment = swanlab.init(
             project=self.project,
             experiment_name=self.experiment_name,
@@ -23,13 +32,15 @@ class SwanlabMonitor:
         """
         记录指标，metrics 为字典，例如 {"loss": 0.1, "acc": 0.9}
         """
-        swanlab.log(metrics, step=step)
+        if swanlab is not None:
+            swanlab.log(metrics, step=step)
     
     def finish(self):
         """
         结束实验
         """
-        swanlab.finish()
+        if self.enabled:
+            swanlab.finish()
 
 # 使用示例
 if __name__ == "__main__":
